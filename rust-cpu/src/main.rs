@@ -1,6 +1,7 @@
 //! S-AES [2] and Double S-AES: exhaustive and MITM wall-clock benchmarks.
 //! Each S-AES includes the initial AddRoundKey.
 
+use rayon::prelude::*;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -125,6 +126,23 @@ fn saes_exhaustive(plaintext: u16, ciphertext: u16) -> (Vec<u16>, f64) {
     (hits, t0.elapsed().as_secs_f64())
 }
 
+fn saes_exhaustive_parallel(plaintext: u16, ciphertext: u16) -> (Vec<u16>, f64) {
+    let t0 = Instant::now();
+    let mut hits: Vec<u16> = (0u32..=0xFFFF)
+        .into_par_iter()
+        .filter_map(|k| {
+            let k = k as u16;
+            if saes_encrypt(plaintext, k) == ciphertext {
+                Some(k)
+            } else {
+                None
+            }
+        })
+        .collect();
+    hits.sort_unstable();
+    (hits, t0.elapsed().as_secs_f64())
+}
+
 fn mitm_double(plaintext: u16, ciphertext: u16) -> (Vec<(u16, u16)>, u64, f64) {
     let t0 = Instant::now();
     let mut by_middle = vec![Vec::new(); 0x10000];
@@ -159,6 +177,29 @@ fn exhaustive_rate(plaintext: u16, trials: u64) -> f64 {
     t0.elapsed().as_secs_f64()
 }
 
+/// Same 2^32 `double_encrypt` trials as `exhaustive_rate`, split across Rayon threads.
+fn exhaustive_rate_parallel(plaintext: u16, trials: u64) -> f64 {
+    let nthreads = rayon::current_num_threads() as u64;
+    let chunk = trials.div_ceil(nthreads);
+    let t0 = Instant::now();
+    let acc: u16 = (0..nthreads)
+        .into_par_iter()
+        .map(|t| {
+            let start = t * chunk;
+            let end = (start + chunk).min(trials);
+            let mut local = 0u16;
+            for i in start..end {
+                let ka = (i & 0xFFFF) as u16;
+                let kb = ((i >> 16) & 0xFFFF) as u16;
+                local ^= double_encrypt(plaintext, ka, kb);
+            }
+            local
+        })
+        .reduce(|| 0, |a, b| a ^ b);
+    black_box(acc);
+    t0.elapsed().as_secs_f64()
+}
+
 fn main() {
     let p = 0x6F6Bu16;
     let k = 0xA73Bu16;
@@ -172,17 +213,25 @@ fn main() {
     assert_eq!(c_double, 0xD62C);
     assert_eq!(saes_decrypt(saes_decrypt(c_double, kb), ka), p);
 
+    let nthreads = rayon::current_num_threads();
     println!("S-AES and Double S-AES (Rust, release)");
     println!("  S-AES [2]     P={p:04X}  K={k:04X}  C={c_saes:04X}");
     println!("  Double S-AES  P={p:04X}  KA={ka:04X}  KB={kb:04X}  C={c_double:04X}");
+    println!("  Rayon threads {nthreads}");
     println!();
 
     let (saes_hits, saes_s) = saes_exhaustive(p, c_saes);
+    let (saes_hits_par, saes_par_s) = saes_exhaustive_parallel(p, c_saes);
     println!("S-AES exhaustive  (2^16 master keys)");
     println!("  hits on one pair     {}", saes_hits.len());
     println!("  published K in list  {}", saes_hits.contains(&k));
-    println!("  time                 {saes_s:.6} s");
-    println!("  per trial            {:.2} ns", saes_s / 65536.0 * 1e9);
+    println!("  time, one core       {saes_s:.6} s");
+    println!("  time, {nthreads} cores      {saes_par_s:.6} s");
+    println!("  per trial (1 core)   {:.2} ns", saes_s / 65536.0 * 1e9);
+    println!(
+        "  parallel hits match  {}",
+        saes_hits_par.len() == saes_hits.len()
+    );
     println!();
 
     let (hits, mitm_ops, mitm_s) = mitm_double(p, c_double);
@@ -197,16 +246,28 @@ fn main() {
     let full: u64 = 1u64 << 32;
     println!("Double S-AES exhaustive FULL 2^32 (every trial)");
     let full_s = exhaustive_rate(p, full);
-    println!("  time       {full_s:.2} s  ({:.2} min)", full_s / 60.0);
-    println!("  per trial  {:.2} ns", (full_s / full as f64) * 1e9);
+    println!("  time, one core       {full_s:.2} s  ({:.2} min)", full_s / 60.0);
+    println!("  per trial (1 core)   {:.2} ns", (full_s / full as f64) * 1e9);
+    let full_par_s = exhaustive_rate_parallel(p, full);
+    println!(
+        "  time, {nthreads} cores      {full_par_s:.2} s  ({:.2} min)",
+        full_par_s / 60.0
+    );
+    println!(
+        "  per trial ({nthreads} cores)  {:.2} ns",
+        (full_par_s / full as f64) * 1e9
+    );
+    println!("  speedup              {:.2}x", full_s / full_par_s);
     println!();
 
     println!("Compare (this Rust CPU run)");
-    println!("  S-AES 2^16              {saes_s:.6} s");
-    println!("  Double MITM 2^17        {mitm_s:.4} s");
-    println!("  Double exhaustive 2^32  {full_s:.2} s");
+    println!("  S-AES 2^16, one core           {saes_s:.6} s");
+    println!("  S-AES 2^16, {nthreads} cores          {saes_par_s:.6} s");
+    println!("  Double MITM 2^17               {mitm_s:.4} s");
+    println!("  Double exhaustive 2^32, 1 core {full_s:.2} s");
+    println!("  Double exhaustive 2^32, {nthreads} cores {full_par_s:.2} s");
     println!(
-        "  2^32 / 2^16             {:.0}x more trials",
+        "  2^32 / 2^16                    {:.0}x more trials",
         (1u64 << 32) as f64 / (1u64 << 16) as f64
     );
 }
