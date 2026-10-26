@@ -2,7 +2,6 @@
 //! Each S-AES includes the initial AddRoundKey.
 
 use rayon::prelude::*;
-use std::hint::black_box;
 use std::time::Instant;
 
 const SBOX: [u8; 16] = [
@@ -165,39 +164,49 @@ fn mitm_double(plaintext: u16, ciphertext: u16) -> (Vec<(u16, u16)>, u64, f64) {
     (hits, enc_calls, secs)
 }
 
-fn exhaustive_rate(plaintext: u16, trials: u64) -> f64 {
-    let t0 = Instant::now();
-    let mut acc = 0u16;
-    for i in 0..trials {
-        let ka = (i & 0xFFFF) as u16;
-        let kb = ((i >> 16) & 0xFFFF) as u16;
-        acc ^= double_encrypt(plaintext, ka, kb);
+fn double_exhaustive_range(plaintext: u16, ciphertext: u16, ka0: u32, ka1: u32) -> (u64, u32) {
+    let mut hits = 0u64;
+    let mut last = 0u32;
+    for ka in ka0..ka1 {
+        let ka16 = ka as u16;
+        for kb in 0u32..0x10000 {
+            if double_encrypt(plaintext, ka16, kb as u16) == ciphertext {
+                hits += 1;
+                last = (ka << 16) | kb;
+            }
+        }
     }
-    black_box(acc);
-    t0.elapsed().as_secs_f64()
+    (hits, last)
 }
 
-/// Same 2^32 `double_encrypt` trials as `exhaustive_rate`, split across Rayon threads.
-fn exhaustive_rate_parallel(plaintext: u16, trials: u64) -> f64 {
-    let nthreads = rayon::current_num_threads() as u64;
-    let chunk = trials.div_ceil(nthreads);
+fn double_exhaustive(plaintext: u16, ciphertext: u16) -> (u64, u32, f64) {
     let t0 = Instant::now();
-    let acc: u16 = (0..nthreads)
+    let (hits, last) = double_exhaustive_range(plaintext, ciphertext, 0, 0x10000);
+    (hits, last, t0.elapsed().as_secs_f64())
+}
+
+fn double_exhaustive_parallel(plaintext: u16, ciphertext: u16) -> (u64, u32, f64) {
+    let nthreads = rayon::current_num_threads() as u32;
+    let chunk = (0x10000 + nthreads - 1) / nthreads;
+    let t0 = Instant::now();
+    let parts: Vec<(u64, u32)> = (0..nthreads)
         .into_par_iter()
         .map(|t| {
             let start = t * chunk;
-            let end = (start + chunk).min(trials);
-            let mut local = 0u16;
-            for i in start..end {
-                let ka = (i & 0xFFFF) as u16;
-                let kb = ((i >> 16) & 0xFFFF) as u16;
-                local ^= double_encrypt(plaintext, ka, kb);
-            }
-            local
+            let end = (start + chunk).min(0x10000);
+            double_exhaustive_range(plaintext, ciphertext, start, end)
         })
-        .reduce(|| 0, |a, b| a ^ b);
-    black_box(acc);
-    t0.elapsed().as_secs_f64()
+        .collect();
+    let secs = t0.elapsed().as_secs_f64();
+    let mut hits = 0u64;
+    let mut last = 0u32;
+    for (h, packed) in parts {
+        hits += h;
+        if packed != 0 {
+            last = packed;
+        }
+    }
+    (hits, last, secs)
 }
 
 fn main() {
@@ -245,10 +254,13 @@ fn main() {
 
     let full: u64 = 1u64 << 32;
     println!("Double S-AES exhaustive FULL 2^32 (every trial)");
-    let full_s = exhaustive_rate(p, full);
+    let (full_hits, full_last, full_s) = double_exhaustive(p, c_double);
+    println!("  hits, one core       {full_hits}");
+    println!("  last packed          {full_last:08X}");
     println!("  time, one core       {full_s:.2} s  ({:.2} min)", full_s / 60.0);
     println!("  per trial (1 core)   {:.2} ns", (full_s / full as f64) * 1e9);
-    let full_par_s = exhaustive_rate_parallel(p, full);
+    let (full_par_hits, _, full_par_s) = double_exhaustive_parallel(p, c_double);
+    println!("  hits, {nthreads} cores      {full_par_hits}");
     println!(
         "  time, {nthreads} cores      {full_par_s:.2} s  ({:.2} min)",
         full_par_s / 60.0

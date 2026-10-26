@@ -1,0 +1,2 @@
+# Python Metal host only (macOS). The kernel is still metal/saes.metal.
+pyobjc-framework-Metal>=10.0

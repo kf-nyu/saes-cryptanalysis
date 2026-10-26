@@ -1,128 +1,172 @@
 # Exhaustive search, MITM, and differential cryptanalysis of S-AES
 
-S-AES [1] is a 16-bit block cipher with a 16-bit master key, including the initial AddRoundKey. Double S-AES is that cipher run twice, with independent keys $K\_A$ and $K\_B$:
+## Summary
+
+This repo times **exhaustive search** and **meet-in-the-middle (MITM)** on S-AES [1] and Double S-AES, plus a short **differential** check on S-AES. The same searches are implemented in **Python**, **Rust**, and **C++**, on **CPU** and on **GPU**.
+
+S-AES is a 16-bit block cipher with a 16-bit key (including the initial AddRoundKey). Double S-AES is that cipher run twice, with two independent keys:
 
 $$
-C = \mathrm{SAES}\_{K\_B}(\mathrm{SAES}\_{K\_A}(P)).
+C = \mathrm{SAES}_{K_B}(\mathrm{SAES}_{K_A}(P)).
 $$
 
-This repo times exhaustive search of S-AES ($2^{16}$) against meet-in-the-middle and exhaustive search of Double S-AES ($2^{17}$ and $2^{32}$), and a differential attack on S-AES.
-
-Published single-cipher check from [1]:
-
-$$
-P = \mathrm{6F6B}\_{16},\quad K = \mathrm{A73B}\_{16},\quad C = \mathrm{0738}\_{16}
-$$
-
-Double S-AES test vector used here:
-
-$$
-P = \mathrm{6F6B}\_{16},\quad K\_A = \mathrm{A73B}\_{16},\quad K\_B = \mathrm{1337}\_{16},\quad C = \mathrm{D62C}\_{16}
-$$
-
-## What is in here
-
-| path | what it does |
+| symbol | meaning |
 |---|---|
-| `python/saes.py` | S-AES $2^{16}$, Double MITM $2^{17}$, Double exhaustive **sample** (scale to $2^{32}$) |
-| `python/differential.py` | S-box DDT, first-round characteristic, last-round key recovery |
-| `rust-cpu/` | S-AES $2^{16}$, Double MITM $2^{17}$, **all** $2^{32}$ Double trials on one core and on all CPU cores (Rayon [5]) |
-| `rust-cpu` `--bin differential` | same differential attack as the Python file |
-| `rust-gpu/` | **all** $2^{16}$ S-AES and **all** $2^{32}$ Double trials on GPU (wgpu [6] → Metal) |
+| P | plaintext (16-bit block we encrypt) |
+| K | S-AES master key (16-bit) |
+| C | ciphertext (16-bit block we observe) |
+| K<sub>A</sub> | first Double S-AES key (encrypts P) |
+| K<sub>B</sub> | second Double S-AES key (encrypts the inner result) |
+
+Check values used everywhere:
+
+- S-AES [1]: P = 6F6B<sub>16</sub>, K = A73B<sub>16</sub>, C = 0738<sub>16</sub>
+- Double S-AES: P = 6F6B<sub>16</sub>, K<sub>A</sub> = A73B<sub>16</sub>, K<sub>B</sub> = 1337<sub>16</sub>, C = D62C<sub>16</sub>
+
+On one pair, exhaustive S-AES finds **2** keys (A73B is one). Double S-AES MITM and full 2<sup>32</sup> search both report **64,894** (K<sub>A</sub>, K<sub>B</sub>) hits.
+
+## Folder layout
+
+Four top-level folders. CPU / wgpu / Metal sit under the language that hosts them. The shared GPU kernel is under `metal/`.
+
+```
+saes-study/
+├── python/
+│   ├── cpu/                 S-AES, MITM, scaled 2^32, differential (CPU)
+│   └── metal/               Python host for metal/saes.metal (PyObjC [9])
+├── rust/
+│   ├── cpu/                 one core and all cores (Rayon [5])
+│   ├── wgpu/                GPU via wgpu [6] (WGSL [8])
+│   └── metal/               GPU host for metal/saes.metal
+├── cpp/
+│   ├── cpu/                 one core, std::thread, and oneTBB [10]
+│   └── metal/               GPU host for metal/saes.metal
+└── metal/
+    └── saes.metal           shared Metal shader [7]
+```
+
+`python/metal`, `rust/metal`, and `cpp/metal` are three hosts. They load the same shader. They do not start each other. The cipher search on GPU is in `metal/saes.metal`, not in the Python host.
+
+## Shader
+
+A shader is a small program that runs on the GPU. The host only loads it, passes P and C, and starts many threads.
+
+`metal/saes.metal` (`exhaustive_saes`): one thread per 16-bit key (2<sup>16</sup>). `exhaustive`: one thread per K<sub>A</sub>, that thread tries every K<sub>B</sub> (2<sup>32</sup>).
+
+`rust/wgpu` uses a second shader, `rust/wgpu/src/shader.wgsl`. Same search, different language. That is why wgpu and native Metal are two rows.
 
 ## How to run
 
-Python:
+Python CPU:
 
 ```bash
-python python/saes.py
-python python/differential.py
+python python/cpu/saes.py
+python python/cpu/differential.py
 ```
 
-Rust CPU (one core, then all cores via Rayon [5]; full $2^{32}$ on one core takes about one to two minutes):
+Python Metal host (not the C++ binary):
 
 ```bash
-cd rust-cpu && cargo run --release --bin double_mini_crack
-cd rust-cpu && cargo run --release --bin differential
+python3 -m venv python/.venv
+python/.venv/bin/pip install -r python/requirements-metal.txt
+python/.venv/bin/python python/metal/saes_metal.py
 ```
 
-Cap threads with `RAYON_NUM_THREADS=4 cargo run --release --bin double_mini_crack` if you want a smaller run.
-
-Rust + GPU (full $2^{16}$ and $2^{32}$, needs a wgpu [6] / Metal device):
+Rust:
 
 ```bash
-cd rust-gpu && cargo run --release
+cd rust/cpu && cargo run --release --bin double_mini_crack
+cd rust/cpu && cargo run --release --bin differential
+cd rust/wgpu && cargo run --release
+cd rust/metal && cargo run --release
 ```
 
-## Measured times (MacBook Pro, M4 Max, 48 GB RAM)
+C++:
 
-S-AES exhaustive list: $2^{16} = 65536$ master keys.  
-Double S-AES exhaustive list: $2^{32} = 4294967296$ pairs $(K\_A, K\_B)$.
+```bash
+brew install tbb
+cd cpp && make cpu && ./cpu/saes_cpu
+cd cpp && make gpu && ./metal/saes_gpu
+```
 
-| | S-AES $2^{16}$ | Double MITM $2^{17}$ | Double exhaustive $2^{32}$ |
+## Measured times
+
+<small>Times below are from one MacBook Pro, M4 Max, 48 GB RAM.</small>
+
+S-AES list: 2<sup>16</sup> = 65536 keys. Double S-AES list: 2<sup>32</sup> = 4294967296 pairs (K<sub>A</sub>, K<sub>B</sub>). Python 2<sup>32</sup> is a scaled estimate, not a full run.
+
+| | S-AES 2<sup>16</sup> | Double MITM 2<sup>17</sup> | Double exhaustive 2<sup>32</sup> |
 |---|---|---|---|
-| Python | 0.28 s (full) | 0.60 s | ~10.4 h (scaled, not a full run) |
-| Rust, one CPU core | 0.00048 s (full) | 0.0040 s | 79.3 s (full) |
-| Rust, all CPU cores (Rayon [5], 16) | 0.00040 s (full) | — | 4.50 s (full) |
-| Rust + GPU (wgpu [6] / Metal) | 0.0013 s (full) | — | 1.13 s (full) |
+| Python CPU | 0.27 s (full) | 0.57 s | ~10.4 h (scaled) |
+| Python host + Metal shader | 0.00057 s (full) | — | 0.18 s (full) |
+| Rust CPU, 1 core | 0.00062 s (full) | 0.0059 s | 21.47 s (full) |
+| Rust CPU, 16 cores | 0.00077 s (full) | — | 1.99 s (full) |
+| Rust wgpu | 0.0014 s (full) | — | 1.13 s (full) |
+| Rust Metal | 0.0017 s (full) | — | 0.18 s (full) |
+| C++ CPU, 1 core | 0.0013 s (full) | 0.012 s | 72.03 s (full) |
+| C++ CPU, 16 cores | 0.00052 s (full) | — | 6.56 s (full) |
+| C++ Metal | 0.00027 s (full) | — | 0.18 s (full) |
 
-On the published S-AES pair, exhaustive search found **2** keys (the published $K=\mathrm{A73B}\_{16}$ is one of them).  
-On the Double S-AES pair, MITM and the GPU exhaustive run both reported **64,894** hits.
+C++ Metal, Rust Metal, and the Python Metal host all finished full 2<sup>32</sup> in 0.18 s (same `metal/saes.metal`). Rust wgpu was 1.13 s. Rust 16-core CPU was 1.99 s vs 21.47 s on one core. C++ 16-core was 6.56 s vs 72.03 s. The CPU 2<sup>32</sup> runs print 64,894 hits.
 
-S-AES is crackable on a laptop CPU. A GPU is not required: the $2^{16}$ GPU run is slower than one Rust CPU core because launch overhead dominates a short list. Multi-core does not help $2^{16}$ either (0.00058 s one core vs 0.00040 s on 16 cores). The GPU helps on the $2^{32}$ Double list (~70× vs one Rust CPU core, ~4× vs 16 CPU cores). This machine's 16-core Rayon run was 4.50 s vs 78.46 s on one core (~17×).
+2<sup>16</sup> is short enough that launch cost can dominate. Multi-core and GPU matter on 2<sup>32</sup>.
 
-A two-round MITM that treats $K\_1$ and $K\_2$ as independent does not apply to S-AES as written, because the first half also uses $K\_0=K$. That does not raise the master-key space above $2^{16}$.
+A two-round MITM that treats K<sub>1</sub> and K<sub>2</sub> as independent does not apply to S-AES as written, because the first half also uses K<sub>0</sub> = K. That does not raise the master-key space above 2<sup>16</sup>.
 
 ## Differential cryptanalysis
 
 Tables below are computed from the S-box, not copied from [1]. The attack is the last-round peel of Biham and Shamir [2].
 
-The 4-bit S-box DDT has maximum $4$ (for $\Delta\_{\mathrm{in}}\neq 0$), so the best one-nibble S-box differential has probability $4/16=2^{-2}$. After ShiftRows and MixColumns, that is a first-round characteristic
+The 4-bit S-box DDT has maximum 4 (for a nonzero input difference), so the best one-nibble S-box differential has probability 4/16 = 2<sup>-2</sup>. After ShiftRows and MixColumns, that is a first-round characteristic
 
 $$
-\Delta P = \mathrm{1000}\_{16} \longrightarrow \Delta X = \mathrm{D100}\_{16}
+\Delta P = \mathrm{1000}_{16} \longrightarrow \Delta X = \mathrm{D100}_{16}
 $$
 
-with probability $1/4$. $K\_0$ and $K\_1$ cancel in the difference. The last round is peeled with a guess of $K\_2$; the key schedule is then inverted and checked on the published pair $\mathrm{6F6B}\_{16} \mapsto \mathrm{0738}\_{16}$.
+with probability 1/4. K<sub>0</sub> and K<sub>1</sub> cancel in the difference. The last round is peeled with a guess of K<sub>2</sub>; the key schedule is then inverted and checked on the published pair
 
-32 chosen pairs (64 plaintexts), secret $K=\mathrm{A73B}\_{16}$:
+$$
+\mathrm{6F6B}_{16} \mapsto \mathrm{0738}_{16}.
+$$
 
-| | S-AES recovered? | true $K\_2$ score | time |
+32 chosen pairs (64 plaintexts), secret K = A73B<sub>16</sub>:
+
+| | S-AES recovered? | true K<sub>2</sub> score | time |
 |---|---|---|---|
-| Python | yes ($\mathrm{A73B}$) | $7/32$ | 2.52 s |
-| Rust, one CPU core | yes ($\mathrm{A73B}$) | $7/32$ | 0.0022 s |
+| Python | yes (A73B) | 7/32 | 2.52 s |
+| Rust, one CPU core | yes (A73B) | 7/32 | 0.0022 s |
 
-256 values of $K\_2$ tied at score 7; the published pair isolates the master key. Exhaustive $2^{16}$ is still faster on this cipher (0.00048 s Rust): the differential loop also visits $2^{16}$ last-round keys, once per pair. A GPU does not help.
+256 values of K<sub>2</sub> tied at score 7; the published pair isolates the master key. Exhaustive 2<sup>16</sup> is still faster on this cipher (0.00062 s Rust): the differential loop also visits 2<sup>16</sup> last-round keys, once per pair. A GPU does not help.
 
-The same 32 pairs and the same last-round peel on Double S-AES ($K\_A=\mathrm{A73B}\_{16}$, $K\_B=\mathrm{1337}\_{16}$) give the true outer $K\_2$ a score of $0$. The inner S-AES randomizes the difference, so the first-round characteristic does not arrive at the outer last round. Two-round S-AES differentials exist at $p=2^{-6}$; they do not make Double S-AES easier than MITM ($2^{17}$, one pair).
+The same 32 pairs and the same last-round peel on Double S-AES (K<sub>A</sub> = A73B<sub>16</sub>, K<sub>B</sub> = 1337<sub>16</sub>) give the true outer K<sub>2</sub> a score of 0. The inner S-AES randomizes the difference, so the first-round characteristic does not arrive at the outer last round. Two-round S-AES differentials exist at p = 2<sup>-6</sup>; they do not make Double S-AES easier than MITM (2<sup>17</sup>, one pair).
 
-[1] studies linear and differential attacks on S-AES. AES-128 [4] has ten rounds and an 8-bit S-box whose best differential probability is $2^{-6}$; that is why a differential attack on AES-128 is a research problem and exhaustive search is not a substitute.
+[1] studies linear and differential attacks on S-AES. AES-128 [4] has ten rounds and an 8-bit S-box whose best differential probability is 2<sup>-6</sup>; that is why a differential attack on AES-128 is a research problem and exhaustive search is not a substitute.
 
 ## AES-128: practical to use; exhaustive search is not
 
-AES-128 is practical to **use**. Exhaustive **search** of AES-128 is not practical on this MacBook Pro (M4 Max, 48 GB).
+AES-128 is practical to **use**. Exhaustive **search** of AES-128 is not practical on this machine.
 
-AES-128 has $2^{128}$ keys. That is $2^{96}$ times the measured Double S-AES $2^{32}$ runs on the same machine:
-
-$$
-79.3 \times 2^{96}\ \mathrm{s} \approx 2.0 \times 10^{23}\ \mathrm{years}\ (\mathrm{one\ Rust\ CPU\ core})
-$$
+AES-128 has 2<sup>128</sup> keys. That is 2<sup>96</sup> times the measured Double S-AES 2<sup>32</sup> runs on the same machine:
 
 $$
-1.13 \times 2^{96}\ \mathrm{s} \approx 2.9 \times 10^{21}\ \mathrm{years}\ (\mathrm{GPU/Metal})
+21.47 \times 2^{96}\ \mathrm{s} \approx 5.4 \times 10^{22}\ \mathrm{years}\ (\mathrm{one\ Rust\ CPU\ core})
 $$
 
-Those figures treat one AES-128 encryption as no more work than one Double S-AES trial. A real AES-128 trial is heavier (ten rounds, 128-bit state), so the search would take longer, not shorter. A ~70× GPU speedup vs one CPU core is a constant. It does not turn $2^{128}$ into $2^{32}$.
+$$
+0.18 \times 2^{96}\ \mathrm{s} \approx 4.5 \times 10^{20}\ \mathrm{years}\ (\mathrm{native\ Metal})
+$$
+
+Those figures treat one AES-128 encryption as no more work than one Double S-AES trial. A real AES-128 trial is heavier (ten rounds, 128-bit state), so the search would take longer, not shorter. A ~119× native-Metal speedup vs one Rust CPU core is a constant. It does not turn 2<sup>128</sup> into 2<sup>32</sup>.
 
 ## S-AES vs Double S-AES vs AES-128
 
-| | master key | exhaustive list | on this MacBook Pro (M4 Max, 48 GB) |
+| | master key | exhaustive list | on this machine |
 |---|---|---|---|
-| S-AES [1] | 16-bit $K$ | $2^{16}$ | 0.00048 s CPU, 0.0013 s GPU; DC 0.0022 s CPU |
-| Double S-AES | 16-bit $K\_A$ and 16-bit $K\_B$ | $2^{32}$ | 79.3 s CPU, 1.13 s GPU; MITM 0.0040 s; DC does not isolate |
-| AES-128 [4] | 128-bit $K$ | $2^{128}$ | $\approx 2.0 \times 10^{23}$ y CPU, $\approx 2.9 \times 10^{21}$ y GPU (same machine, scaled from $2^{32}$) |
+| S-AES [1] | 16-bit K | 2<sup>16</sup> | 0.00062 s Rust CPU, 0.00027 s C++ Metal; DC 0.0022 s CPU |
+| Double S-AES | 16-bit K<sub>A</sub> and 16-bit K<sub>B</sub> | 2<sup>32</sup> | 21.47 s Rust CPU, 0.18 s native Metal; MITM 0.0059 s; DC does not isolate |
+| AES-128 [4] | 128-bit K | 2<sup>128</sup> | ≈ 5.4 × 10<sup>22</sup> y CPU, ≈ 4.5 × 10<sup>20</sup> y native Metal (scaled from 2<sup>32</sup>) |
 
-Double S-AES is two independent 16-bit S-AES keys in a row. MITM on that composition is $2^{17}$ operations, not $2^{32}$ [3]. Two short ciphers in a row do not give 32-bit security against MITM (2DES at this size).
+Double S-AES is two independent 16-bit S-AES keys in a row. MITM on that composition is 2<sup>17</sup> operations, not 2<sup>32</sup> [3]. Two short ciphers in a row do not give 32-bit security against MITM (2DES at this size).
 
 ## References
 
@@ -137,3 +181,11 @@ Double S-AES is two independent 16-bit S-AES keys in a row. MITM on that composi
 [5] N. Matsakis and the Rayon contributors, *Rayon: A data parallelism library for Rust*. https://github.com/rayon-rs/rayon
 
 [6] gfx-rs, *wgpu: Cross-platform, safe GPU API in Rust* (WebGPU in Rust). https://wgpu.rs https://github.com/gfx-rs/wgpu
+
+[7] Apple Inc., *Metal Shading Language Specification*. https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
+
+[8] World Wide Web Consortium, *WebGPU Shading Language (WGSL)*, W3C. https://www.w3.org/TR/WGSL/
+
+[9] Ronald Oussoren and contributors, *PyObjC: Python bindings for the Objective-C runtime* (including Metal). https://pyobjc.readthedocs.io/
+
+[10] Intel Corporation, *oneAPI Threading Building Blocks (oneTBB)*. https://github.com/uxlfoundation/oneTBB

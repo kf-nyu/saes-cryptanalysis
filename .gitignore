@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .DS_Store
 *.swp
+python/.venv/
+cpp/cpu/saes_cpu
+cpp/metal/saes_gpu
+cpp/*.air
+cpp/*.metallib
